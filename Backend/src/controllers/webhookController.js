@@ -1,5 +1,6 @@
 
 import crypto from "node:crypto";
+import mongoose from "mongoose";
 import Invoice from "../models/Invoice.js";
 import IntegrationLog from "../models/IntegrationLog.js";
 import Customer from "../models/Customer.js";
@@ -18,157 +19,171 @@ const verifyWebhookSignature = (req) => {
     .digest("hex");
 
   const receivedBuffer = Buffer.from(signature, "hex");
-  const expectedBuffer = Buffer.from(
-    expectedSignature,
-    "hex"
-  );
+  const expectedBuffer = Buffer.from(expectedSignature, "hex");
 
   return (
     receivedBuffer.length === expectedBuffer.length &&
-    crypto.timingSafeEqual(
-      receivedBuffer,
-      expectedBuffer
-    )
+    crypto.timingSafeEqual(receivedBuffer, expectedBuffer)
   );
 };
 
 export const receiveBillPortWebhook = async (req, res) => {
+  if (!verifyWebhookSignature(req)) {
+    return res.status(401).json({
+      message: "Invalid webhook signature",
+    });
+  }
+
+  const {
+    eventId,
+    externalId,
+    status,
+    sequence,
+    occurredAt,
+  } = req.body;
+
+  if (
+    !eventId ||
+    !externalId ||
+    !status ||
+    !Number.isInteger(sequence) ||
+    sequence < 1 ||
+    !occurredAt
+  ) {
+    return res.status(400).json({
+      message: "Invalid webhook payload",
+    });
+  }
+
+  const allowedStatuses = ["SENT", "VIEWED", "PAID", "FAILED"];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({
+      message: "Unsupported invoice status",
+    });
+  }
+
+  const statusMap = {
+    SENT: "sent",
+    VIEWED: "viewed",
+    PAID: "paid",
+    FAILED: "failed",
+  };
+
+  const session = await mongoose.startSession();
+
   try {
-    // 1. Verify signature before processing the event.
-    if (!verifyWebhookSignature(req)) {
-      return res.status(401).json({
-        message: "Invalid webhook signature",
-      });
-    }
+    let result;
 
-    const {
-      eventId,
-      externalId,
-      status,
-      sequence,
-      occurredAt,
-    } = req.body;
-
-    // 2. Validate the webhook payload.
-    if (
-      !eventId ||
-      !externalId ||
-      !status ||
-      !Number.isInteger(sequence) ||
-      sequence < 1 ||
-      !occurredAt
-    ) {
-      return res.status(400).json({
-        message: "Invalid webhook payload",
-      });
-    }
-
-    const allowedStatuses = [
-      "SENT",
-      "VIEWED",
-      "PAID",
-      "FAILED",
-    ];
-
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({
-        message: "Unsupported invoice status",
-      });
-    }
-
-    // 3. Find the invoice.
-    const invoice = await Invoice.findOne({ externalId });
-
-    if (!invoice) {
-      return res.status(404).json({
-        message: "Invoice not found",
-      });
-    }
-
-    // 4. Prevent duplicate webhook events.
-    const existingEvent = await IntegrationLog.findOne({
-      eventId,
-      direction: "inbound",
-    });
-
-    if (existingEvent) {
-      return res.status(200).json({
-        message: "Duplicate event ignored",
-      });
-    }
-
-    // 5. Ignore old or out-of-order events.
-    if (sequence <= invoice.lastSequence) {
-      await IntegrationLog.create({
-        invoiceId: invoice._id,
-        direction: "inbound",
-        eventType: `invoice.${status.toLowerCase()}`,
+    await session.withTransaction(async () => {
+      // Check whether this exact event was already processed.
+      const existingEvent = await IntegrationLog.findOne({
         eventId,
-        requestPayload: req.body,
-        outcome: "duplicate",
-        errorMessage: "Stale or out-of-order event ignored",
-      });
+        direction: "inbound",
+      }).session(session);
 
-      return res.status(200).json({
-        message: "Stale event ignored",
-      });
-    }
+      if (existingEvent) {
+        result = {
+          message: "Duplicate event ignored",
+          duplicate: true,
+        };
+        return;
+      }
 
-    // 6. Save event before applying the status.
-    await IntegrationLog.create({
-      invoiceId: invoice._id,
-      direction: "inbound",
-      eventType: `invoice.${status.toLowerCase()}`,
-      eventId,
-      requestPayload: req.body,
-      outcome: "success",
-      httpStatus: 200,
-    });
+      const invoice = await Invoice.findOne({
+        externalId,
+      }).session(session);
 
-    // 7. Update invoice status.
-    const statusMap = {
-      SENT: "sent",
-      VIEWED: "viewed",
-      PAID: "paid",
-      FAILED: "failed",
-    };
+      if (!invoice) {
+        throw new Error("Invoice not found");
+      }
 
-    const previousStatus = invoice.status;
+      // Ignore older or out-of-order events.
+      if (sequence <= invoice.lastSequence) {
+        await IntegrationLog.create(
+          [{
+            invoiceId: invoice._id,
+            direction: "inbound",
+            eventType: `invoice.${status.toLowerCase()}`,
+            eventId,
+            requestPayload: req.body,
+            outcome: "duplicate",
+            errorMessage: "Stale or out-of-order event ignored",
+            httpStatus: 200,
+          }],
+          { session }
+        );
 
-    invoice.status = statusMap[status];
-    invoice.lastSequence = sequence;
+        result = {
+          message: "Stale event ignored",
+          duplicate: true,
+        };
+        return;
+      }
 
-    await invoice.save();
+      const previousStatus = invoice.status;
 
-    // 8. Reduce customer outstanding balance only once.
-    if (
-      status === "PAID" &&
-      previousStatus !== "paid"
-    ) {
-      await Customer.updateOne(
-        { _id: invoice.customerId },
-        {
-          $max: {
-            outstandingBalance: 0,
+      // Update invoice status inside the transaction.
+      invoice.status = statusMap[status];
+      invoice.lastSequence = sequence;
+
+      await invoice.save({ session });
+
+      // Apply the balance reduction only on the first transition to PAID.
+      if (status === "PAID" && previousStatus !== "paid") {
+        const customerUpdate = await Customer.updateOne(
+          { _id: invoice.customerId },
+          {
+            $inc: {
+              outstandingBalance: -invoice.amount,
+            },
           },
-          $inc: {
-            outstandingBalance: -invoice.amount,
-          },
+          { session }
+        );
+
+        if (customerUpdate.matchedCount !== 1) {
+          throw new Error("Customer not found for invoice");
         }
-      );
-    }
+      }
 
-    return res.status(200).json({
-      message: "Webhook processed successfully",
-      externalId,
-      status: invoice.status,
-      sequence,
+      // Log the event in the same transaction.
+      await IntegrationLog.create(
+        [{
+          invoiceId: invoice._id,
+          direction: "inbound",
+          eventType: `invoice.${status.toLowerCase()}`,
+          eventId,
+          requestPayload: req.body,
+          outcome: "success",
+          httpStatus: 200,
+        }],
+        { session }
+      );
+
+      result = {
+        message: "Webhook processed successfully",
+        externalId,
+        status: invoice.status,
+        sequence,
+      };
     });
+
+    return res.status(200).json(result);
+
   } catch (error) {
     console.error("Webhook processing error:", error);
+
+    if (error.message === "Invoice not found") {
+      return res.status(404).json({
+        message: error.message,
+      });
+    }
 
     return res.status(500).json({
       message: "Webhook processing failed",
     });
+
+  } finally {
+    await session.endSession();
   }
 };

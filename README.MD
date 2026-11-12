@@ -226,4 +226,3 @@ DealDesk verifies webhook signatures and checks event IDs and sequence numbers t
 ## Submission
 
 This repository contains the DealDesk backend and BillPort API for the Full Stack Developer assignment.
-
